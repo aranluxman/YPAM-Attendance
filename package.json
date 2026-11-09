@@ -1,0 +1,9 @@
+{
+  "name": "ypam-attendance",
+  "version": "1.0.0",
+  "private": true,
+  "description": "YPAM attendance tracker: a Google Apps Script web app on top of the attendance Google Sheet.",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}

@@ -1,0 +1,532 @@
+<script>
+(function () {
+  'use strict';
+
+  var LOW_PCT = 50; // at or below this, a % shows in orange
+  var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+  var state = {
+    classes: [],
+    className: null,
+    data: null,
+    stats: null,
+    sessionIdx: 0,
+    working: {},   // row -> 'P' | 'A' | '' for the selected session
+    dirty: false,
+    saving: false,
+    tab: 'take',
+    sort: 'low',
+    query: ''
+  };
+
+  function $(id) { return document.getElementById(id); }
+
+  // ------------------------------------------------------------ server calls
+
+  function call(fn) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return new Promise(function (resolve, reject) {
+      var runner = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(reject);
+      runner[fn].apply(runner, args);
+    });
+  }
+
+  function friendlyError(err) {
+    var msg = (err && err.message) ? err.message : String(err || 'Something went wrong.');
+    if (/permission|access denied|not have access/i.test(msg)) {
+      return 'You don’t have edit access to the attendance sheet. Ask the sheet owner to share it with your Google account, then reload.';
+    }
+    return msg;
+  }
+
+  // ------------------------------------------------------------- formatting
+
+  function parseIso(iso) {
+    var p = String(iso).split('-');
+    return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+  }
+  function shortDate(iso) {
+    var d = parseIso(iso);
+    return MONTHS[d.getMonth()] + ' ' + d.getDate();
+  }
+  function longDate(iso) {
+    var d = parseIso(iso);
+    return DAYS[d.getDay()] + ', ' + MONTHS[d.getMonth()] + ' ' + d.getDate();
+  }
+  function dayShortDate(iso) {
+    var d = parseIso(iso);
+    return DAYS[d.getDay()].slice(0, 3) + ', ' + MONTHS[d.getMonth()] + ' ' + d.getDate();
+  }
+  function titleCase(name) {
+    return String(name).toLowerCase().replace(/(^|[\s\-'])([a-z])/g, function (m, sep, ch) {
+      return sep + ch.toUpperCase();
+    });
+  }
+  function initials(name) {
+    var parts = titleCase(name).split(/\s+/).filter(Boolean);
+    return ((parts[0] || '')[0] || '') + ((parts[1] || '')[0] || '');
+  }
+  function pctOf(part, whole) { return whole ? Math.round((part / whole) * 100) : null; }
+
+  // tiny DOM helper: el('div', {class: 'x'}, ['text', childNode])
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        if (k === 'class') node.className = attrs[k];
+        else if (k === 'text') node.textContent = attrs[k];
+        else if (k === 'style') node.style.cssText = attrs[k];
+        else node.setAttribute(k, attrs[k]);
+      });
+    }
+    (children || []).forEach(function (c) {
+      node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    });
+    return node;
+  }
+  function icon(paths, color) {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('width', '20'); svg.setAttribute('height', '20');
+    svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', color); svg.setAttribute('stroke-width', '2');
+    svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    paths.forEach(function (d) {
+      var p = document.createElementNS(ns, d.indexOf('circle:') === 0 ? 'circle' : 'path');
+      if (d.indexOf('circle:') === 0) {
+        var c = d.slice(7).split(',');
+        p.setAttribute('cx', c[0]); p.setAttribute('cy', c[1]); p.setAttribute('r', c[2]);
+      } else {
+        p.setAttribute('d', d);
+      }
+      svg.appendChild(p);
+    });
+    return svg;
+  }
+
+  // ------------------------------------------------------------------ stats
+
+  /** Everything the Members and Dashboard tabs show, from saved sheet data. */
+  function computeStats(data) {
+    var sessions = data.sessions.map(function (s, i) {
+      var p = 0, a = 0;
+      data.students.forEach(function (st) {
+        if (st.marks[i] === 'P') p++;
+        else if (st.marks[i] === 'A') a++;
+      });
+      return { idx: i, date: s.date, label: s.label, p: p, a: a, done: p + a > 0, pct: pctOf(p, p + a) };
+    });
+    var done = sessions.filter(function (s) { return s.done; });
+    var students = data.students.map(function (st) {
+      var came = 0, marked = 0;
+      st.marks.forEach(function (m) {
+        if (m === 'P') { came++; marked++; } else if (m === 'A') { marked++; }
+      });
+      return { row: st.row, name: titleCase(st.name), came: came, marked: marked, pct: pctOf(came, marked) };
+    });
+    var totalP = 0, totalA = 0;
+    done.forEach(function (s) { totalP += s.p; totalA += s.a; });
+    var next = null;
+    for (var i = 0; i < sessions.length; i++) {
+      if (!sessions[i].done) { next = sessions[i]; break; }
+    }
+    return {
+      sessions: sessions,
+      done: done,
+      students: students,
+      byRow: students.reduce(function (m, s) { m[s.row] = s; return m; }, {}),
+      totalP: totalP,
+      totalA: totalA,
+      avg: pctOf(totalP, totalP + totalA),
+      next: next,
+      perfect: students.filter(function (s) { return s.marked > 0 && s.came === s.marked; }).length
+    };
+  }
+
+  // ------------------------------------------------------------- loading
+
+  function setData(data, keepSession) {
+    state.data = data;
+    state.stats = computeStats(data);
+    if (!keepSession || state.sessionIdx >= data.sessions.length) {
+      state.sessionIdx = Math.max(0, data.defaultSession);
+    }
+    loadWorking();
+  }
+
+  function loadWorking() {
+    state.working = {};
+    var i = state.sessionIdx;
+    state.data.students.forEach(function (st) { state.working[st.row] = st.marks[i] || ''; });
+    state.dirty = false;
+  }
+
+  function boot() {
+    call('getClasses').then(function (classes) {
+      if (!classes.length) throw new Error('No class tabs were found in the attendance sheet.');
+      state.classes = classes;
+      var sel = $('class-select');
+      classes.forEach(function (c) {
+        sel.appendChild(el('option', { value: c.name, text: c.name }));
+      });
+      return loadClass(classes[0].name);
+    }).catch(showBootError);
+  }
+
+  function loadClass(name) {
+    $('boot').hidden = false;
+    $('boot').className = 'boot';
+    $('boot').textContent = 'Loading attendance…';
+    return call('getClassData', name).then(function (data) {
+      state.className = name;
+      $('class-select').value = name;
+      setData(data, false);
+      hideMsg();
+      $('boot').hidden = true;
+      $('tabbar').hidden = false;
+      showTab(state.tab);
+    }).catch(showBootError);
+  }
+
+  function showBootError(err) {
+    document.querySelectorAll('.view').forEach(function (v) { v.hidden = true; });
+    $('tabbar').hidden = true;
+    $('boot').hidden = false;
+    $('boot').className = 'boot error';
+    $('boot').textContent = friendlyError(err);
+  }
+
+  // ------------------------------------------------------------------ tabs
+
+  function showTab(tab) {
+    state.tab = tab;
+    ['take', 'members', 'dashboard'].forEach(function (t) {
+      $('view-' + t).hidden = t !== tab;
+    });
+    document.querySelectorAll('#tabbar button').forEach(function (b) {
+      if (b.getAttribute('data-tab') === tab) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
+    });
+    if (tab === 'take') renderTake();
+    if (tab === 'members') renderMembers();
+    if (tab === 'dashboard') renderDashboard();
+  }
+
+  // ------------------------------------------------------- take attendance
+
+  function counts() {
+    var p = 0, a = 0;
+    state.data.students.forEach(function (st) {
+      var m = state.working[st.row];
+      if (m === 'P') p++; else if (m === 'A') a++;
+    });
+    return { p: p, a: a, left: state.data.students.length - p - a };
+  }
+
+  function renderTake() {
+    var data = state.data;
+    var list = $('take-list');
+    list.textContent = '';
+
+    if (!data.sessions.length) {
+      $('session-date').textContent = 'No session dates';
+      $('session-count').textContent = 'Add dates to row 2 of the sheet';
+      list.appendChild(el('li', { class: 'empty', text: 'No sessions found.' }));
+      $('prev-session').disabled = true;
+      $('next-session').disabled = true;
+      updateTakeSummary();
+      return;
+    }
+
+    var s = data.sessions[state.sessionIdx];
+    $('session-date').textContent = longDate(s.date);
+    $('session-count').textContent = 'Session ' + (state.sessionIdx + 1) + ' of ' + data.sessions.length;
+    $('prev-session').disabled = state.sessionIdx === 0;
+    $('next-session').disabled = state.sessionIdx === data.sessions.length - 1;
+    $('student-total').textContent = data.students.length + ' students';
+
+    if (!data.students.length) {
+      list.appendChild(el('li', { class: 'empty', text: 'No students in this class yet. Add names in column B of the sheet.' }));
+    }
+
+    data.students.forEach(function (st) {
+      var info = state.stats.byRow[st.row];
+      var sub = info.pct === null ? 'No sessions yet' : info.pct + '% this season';
+      var name = titleCase(st.name);
+      var pBtn = el('button', { type: 'button', class: 'mark mark-p', 'aria-label': 'Mark ' + name + ' present', text: 'P' });
+      var aBtn = el('button', { type: 'button', class: 'mark mark-a', 'aria-label': 'Mark ' + name + ' absent', text: 'A' });
+      function sync() {
+        pBtn.setAttribute('aria-pressed', String(state.working[st.row] === 'P'));
+        aBtn.setAttribute('aria-pressed', String(state.working[st.row] === 'A'));
+      }
+      function set(mark) {
+        state.working[st.row] = state.working[st.row] === mark ? '' : mark;
+        state.dirty = true;
+        hideMsg();
+        sync();
+        updateTakeSummary();
+      }
+      pBtn.addEventListener('click', function () { set('P'); });
+      aBtn.addEventListener('click', function () { set('A'); });
+      sync();
+      list.appendChild(el('li', { class: 'row' }, [
+        el('div', { class: 'row-text' }, [
+          el('span', { class: 'row-name', text: name }),
+          el('span', { class: 'muted-sm', text: sub })
+        ]),
+        el('div', { class: 'toggles' }, [pBtn, aBtn])
+      ]));
+    });
+    updateTakeSummary();
+  }
+
+  function updateTakeSummary() {
+    var c = counts();
+    $('count-p').textContent = c.p;
+    $('count-a').textContent = c.a;
+    $('count-n').textContent = c.left;
+    $('mark-rest').disabled = c.left === 0 || state.saving;
+    var btn = $('save-btn');
+    if (state.saving) {
+      btn.textContent = 'Saving…';
+      btn.disabled = true;
+    } else if (state.dirty) {
+      btn.textContent = c.left > 0 ? 'Save to Sheet · ' + c.left + ' not marked' : 'Save to Google Sheet';
+      btn.disabled = false;
+    } else {
+      btn.textContent = c.p + c.a > 0 ? 'Saved to Google Sheet' : 'Mark students to save';
+      btn.disabled = true;
+    }
+  }
+
+  function markRest() {
+    state.data.students.forEach(function (st) {
+      if (!state.working[st.row]) state.working[st.row] = 'P';
+    });
+    state.dirty = true;
+    hideMsg();
+    renderTake();
+  }
+
+  function changeSession(delta) {
+    var next = state.sessionIdx + delta;
+    if (next < 0 || next >= state.data.sessions.length) return;
+    if (state.dirty && !window.confirm('You have unsaved marks for this session. Leave without saving?')) return;
+    state.sessionIdx = next;
+    loadWorking();
+    hideMsg();
+    renderTake();
+  }
+
+  function save() {
+    if (state.saving || !state.dirty) return;
+    var s = state.data.sessions[state.sessionIdx];
+    var entries = state.data.students.map(function (st) {
+      return { row: st.row, name: st.name, mark: state.working[st.row] || '' };
+    });
+    state.saving = true;
+    updateTakeSummary();
+    call('saveAttendance', state.className, s.col, s.label, entries).then(function (data) {
+      state.saving = false;
+      setData(data, true);
+      renderTake();
+      showMsg('ok', 'Saved to Google Sheet · ' + shortDate(s.date) + ' column updated');
+    }).catch(function (err) {
+      state.saving = false;
+      updateTakeSummary();
+      showMsg('err', friendlyError(err));
+    });
+  }
+
+  function showMsg(kind, text) {
+    var m = $('save-msg');
+    m.className = 'banner ' + kind;
+    m.textContent = text;
+    m.hidden = false;
+  }
+  function hideMsg() { $('save-msg').hidden = true; }
+
+  // ---------------------------------------------------------------- members
+
+  function renderMembers() {
+    var st = state.stats;
+    var data = state.data;
+    $('members-eyebrow').textContent = classLine();
+    $('members-sub').textContent = data.students.length + ' students · ' + st.done.length + ' of ' + data.sessions.length + ' sessions done';
+    $('sort-low').setAttribute('aria-pressed', String(state.sort === 'low'));
+    $('sort-az').setAttribute('aria-pressed', String(state.sort === 'az'));
+
+    var q = state.query.trim().toLowerCase();
+    var list = st.students.filter(function (s) { return !q || s.name.toLowerCase().indexOf(q) !== -1; });
+    list.sort(function (a, b) {
+      if (state.sort === 'low') {
+        var pa = a.pct === null ? 101 : a.pct;
+        var pb = b.pct === null ? 101 : b.pct;
+        if (pa !== pb) return pa - pb;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
+    var ul = $('member-list');
+    ul.textContent = '';
+    if (!list.length) {
+      ul.appendChild(el('li', { class: 'empty', text: q ? 'No one matches “' + state.query + '”.' : 'No students yet.' }));
+      return;
+    }
+    list.forEach(function (s) {
+      var low = s.pct !== null && s.pct <= LOW_PCT;
+      var pctClass = s.pct === null ? 'pct none' : (low ? 'pct low' : 'pct');
+      ul.appendChild(el('li', { class: 'member' }, [
+        el('span', { class: 'avatar', 'aria-hidden': 'true', text: initials(s.name) }),
+        el('div', { class: 'member-body' }, [
+          el('div', { class: 'member-top' }, [
+            el('span', { class: 'row-name', text: s.name }),
+            el('span', { class: pctClass, text: s.pct === null ? '—' : s.pct + '%' })
+          ]),
+          el('div', { class: 'bar' }, [
+            el('div', { class: low ? 'low' : '', style: 'width:' + (s.pct || 0) + '%' })
+          ]),
+          el('span', { class: 'muted-sm', text: s.marked ? s.came + ' of ' + s.marked + ' sessions' : 'No sessions yet' })
+        ])
+      ]));
+    });
+  }
+
+  function classLine() {
+    var d = state.data;
+    return (d.level ? d.level + ' · ' : '') + d.sheetName;
+  }
+
+  // -------------------------------------------------------------- dashboard
+
+  function renderDashboard() {
+    var st = state.stats;
+    var data = state.data;
+    $('dash-eyebrow').textContent = classLine();
+    $('dash-sub').textContent = data.sessions.length
+      ? 'Season ' + shortDate(data.sessions[0].date) + ' – ' + shortDate(data.sessions[data.sessions.length - 1].date) + ' · ' + data.students.length + ' students'
+      : 'No session dates yet';
+
+    $('kpi-avg').textContent = st.avg === null ? '—' : st.avg + '%';
+    $('kpi-avg-sub').textContent = st.avg === null ? 'No sessions marked yet' : st.totalP + ' present of ' + (st.totalP + st.totalA) + ' marks';
+
+    var last = st.done[st.done.length - 1];
+    $('kpi-last').textContent = last ? last.pct + '%' : '—';
+    $('kpi-last').className = 'kpi-num' + (last && last.pct <= LOW_PCT ? ' orange' : '');
+    $('kpi-last-sub').textContent = last ? shortDate(last.date) + ' · ' + last.p + ' of ' + (last.p + last.a) + ' came' : 'Nothing yet';
+
+    $('kpi-done').textContent = st.done.length + ' / ' + data.sessions.length;
+    $('kpi-done-sub').textContent = st.next ? 'Next: ' + dayShortDate(st.next.date) : 'Season complete';
+    $('kpi-perfect').textContent = st.perfect;
+
+    // chart
+    var chart = $('chart');
+    chart.textContent = '';
+    var labels = [];
+    st.done.forEach(function (s) {
+      var low = s.pct <= LOW_PCT;
+      labels.push(shortDate(s.date) + ' ' + s.pct + '%');
+      chart.appendChild(el('div', { class: 'chart-col' }, [
+        el('div', { class: 'chart-plot' }, [
+          el('span', { class: 'chart-val' + (low ? ' low' : ''), text: s.pct + '%' }),
+          el('div', { class: 'chart-bar' + (low ? ' low' : ''), style: 'height:' + Math.max(4, Math.round(s.pct * 1.15)) + 'px' })
+        ]),
+        el('span', { class: 'chart-date', text: shortDate(s.date) })
+      ]));
+    });
+    if (st.next) {
+      chart.appendChild(el('div', { class: 'chart-col' }, [
+        el('div', { class: 'chart-plot' }, [
+          el('span', { class: 'muted-sm', text: 'Next' }),
+          el('div', { class: 'chart-bar next' })
+        ]),
+        el('span', { class: 'chart-date', text: shortDate(st.next.date) })
+      ]));
+    }
+    chart.setAttribute('aria-label', labels.length ? 'Turnout: ' + labels.join(', ') : 'No sessions marked yet');
+
+    // insights
+    var box = $('insights');
+    box.textContent = '';
+    insights(st).forEach(function (it) {
+      box.appendChild(el('div', { class: 'insight' }, [
+        icon(it.icon, it.color),
+        el('div', { class: 'insight-body' }, [
+          el('span', { class: 'insight-title', text: it.title }),
+          el('span', { class: 'insight-sub', text: it.sub })
+        ])
+      ]));
+    });
+  }
+
+  var ICON_UP = ['M3 17l6-6 4 4 8-8', 'M14 7h7v7'];
+  var ICON_DOWN = ['M3 7l6 6 4-4 8 8', 'M21 10v7h-7'];
+  var ICON_ALERT = ['circle:12,12,9', 'M12 8v4', 'M12 16h.01'];
+  var BLUE = '#1F5FD1';
+  var ORANGE = '#C2410C';
+
+  function insights(st) {
+    var out = [];
+    var done = st.done;
+    if (!done.length) {
+      return [{ icon: ICON_ALERT, color: BLUE, title: 'No sessions marked yet', sub: 'Take attendance and your trends show up here.' }];
+    }
+
+    var best = done.reduce(function (b, s) { return s.pct > b.pct ? s : b; }, done[0]);
+    out.push({ icon: ICON_UP, color: BLUE, title: 'Best session: ' + shortDate(best.date),
+      sub: best.p + ' of ' + (best.p + best.a) + ' present (' + best.pct + '%)' });
+
+    // streak at the end: down (or up) N sessions in a row
+    var dir = 0, run = 0;
+    for (var i = done.length - 1; i > 0; i--) {
+      var d = done[i].pct < done[i - 1].pct ? -1 : (done[i].pct > done[i - 1].pct ? 1 : 0);
+      if (d === 0 || (dir !== 0 && d !== dir)) break;
+      dir = d; run++;
+    }
+    if (run >= 2) {
+      var seq = done.slice(done.length - run - 1).map(function (s) { return s.pct + '%'; }).join(' → ');
+      out.push(dir < 0
+        ? { icon: ICON_DOWN, color: ORANGE, title: 'Down ' + run + ' sessions in a row', sub: seq }
+        : { icon: ICON_UP, color: BLUE, title: 'Up ' + run + ' sessions in a row', sub: seq });
+    }
+
+    var none = st.students.filter(function (s) { return s.marked > 0 && s.came === 0; });
+    if (none.length) {
+      out.push({ icon: ICON_ALERT, color: ORANGE,
+        title: none.length + (none.length === 1 ? ' student hasn’t' : ' students haven’t') + ' come yet',
+        sub: none.map(function (s) { return s.name; }).join(', ') + ' · 0 of ' + none[0].marked });
+    }
+    return out;
+  }
+
+  // ----------------------------------------------------------------- wiring
+
+  document.querySelectorAll('#tabbar button').forEach(function (b) {
+    b.addEventListener('click', function () { showTab(b.getAttribute('data-tab')); });
+  });
+  $('prev-session').addEventListener('click', function () { changeSession(-1); });
+  $('next-session').addEventListener('click', function () { changeSession(1); });
+  $('mark-rest').addEventListener('click', markRest);
+  $('save-btn').addEventListener('click', save);
+  $('class-select').addEventListener('change', function (e) {
+    var name = e.target.value;
+    if (state.dirty && !window.confirm('You have unsaved marks. Switch class without saving?')) {
+      e.target.value = state.className;
+      return;
+    }
+    loadClass(name);
+  });
+  $('member-search').addEventListener('input', function (e) { state.query = e.target.value; renderMembers(); });
+  $('sort-low').addEventListener('click', function () { state.sort = 'low'; renderMembers(); });
+  $('sort-az').addEventListener('click', function () { state.sort = 'az'; renderMembers(); });
+  window.addEventListener('beforeunload', function (e) {
+    if (state.dirty) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  boot();
+})();
+</script>
